@@ -1,16 +1,20 @@
-from sqlalchemy import Column, Integer, String, Text
-from app.database import Base
+"""Temporary model placeholders.
 
-class CallRecord(Base):
-    __tablename__ = "call_records"
+SQLAlchemy models are disabled while the backend runs without PostgreSQL.
+"""
 
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    phone = Column(String, nullable=False)
-    status = Column(String, nullable=False)
-    duration = Column(String, nullable=True)
-    external_id = Column(String, nullable=True)
-    questions = Column(Text, nullable=True)
-    responses = Column(Text, nullable=True)
-    transcript = Column(Text, nullable=True)
-    created_at = Column(String, nullable=True)
+from dataclasses import dataclass
+
+
+@dataclass
+class CallRecord:
+    id: int
+    name: str
+    phone: str
+    status: str
+    duration: str | None = None
+    external_id: str | None = None
+    questions: str | None = None
+    responses: str | None = None
+    transcript: str | None = None
+    created_at: str | None = None

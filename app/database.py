@@ -1,18 +1,7 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from dotenv import load_dotenv
-import os
+"""Temporary database placeholder.
 
-load_dotenv()
+PostgreSQL/SQLAlchemy is disabled for Railway deployment until a database is
+configured. Keep this module so the old structure is easy to restore later.
+"""
 
-DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///./ai_call_db.sqlite"
-
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
-
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
-
-Base = declarative_base()
+DATABASE_ENABLED = False
