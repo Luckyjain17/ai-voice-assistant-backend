@@ -12,7 +12,7 @@ load_dotenv()
 
 app = FastAPI()
 
-Base.metadata.create_all(bind=engine)
+# Base.metadata.create_all(bind=engine)
 
 # Ensure recent optional columns exist in the database (safe, idempotent)
 try:
