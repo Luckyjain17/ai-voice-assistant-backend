@@ -2,14 +2,16 @@ import re
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
+from app.database import get_db, safe_database_url
+from app.models import CallRecord
 from app.schemas import CallCreate
 from app.services.vapi import get_call_details, initiate_call
 
 router = APIRouter(prefix="/api")
-TEMP_CALLS: dict[int, dict[str, Any]] = {}
-TEMP_CALLS_BY_EXTERNAL_ID: dict[str, int] = {}
 
 FIXED_CALL_QUESTIONS = [
     "What is your name?",
@@ -39,8 +41,42 @@ def normalize_status(value: str | None) -> str:
         "failed": "Failed",
         "failedtoqueue": "FailedToQueue",
         "failed to queue": "FailedToQueue",
+        "end of call report": "Completed",
     }
     return status_map.get(normalized, str(value).strip().title())
+
+
+def extract_vapi_status(data: dict[str, Any]) -> str | None:
+    message = data.get("message") if isinstance(data.get("message"), dict) else {}
+    call = message.get("call") if isinstance(message.get("call"), dict) else {}
+
+    status = (
+        data.get("status")
+        or message.get("status")
+        or call.get("status")
+    )
+    if isinstance(status, str):
+        return normalize_status(status)
+
+    message_type = message.get("type")
+    if message_type == "end-of-call-report":
+        return "Completed"
+    return None
+
+
+def extract_vapi_duration(data: dict[str, Any]) -> str | None:
+    message = data.get("message") if isinstance(data.get("message"), dict) else {}
+    call = message.get("call") if isinstance(message.get("call"), dict) else {}
+
+    duration = (
+        data.get("durationSeconds")
+        or data.get("duration")
+        or message.get("durationSeconds")
+        or message.get("duration")
+        or call.get("durationSeconds")
+        or call.get("duration")
+    )
+    return str(duration) if duration not in (None, "") else None
 
 
 def split_transcript_lines(transcript: str | None) -> list[str]:
@@ -130,28 +166,42 @@ def extract_responses_from_transcript(questions: list[str], transcript: str | No
     return responses
 
 
-def serialize_call(call: dict[str, Any]) -> dict:
-    questions = call.get("questions", "").split("||") if call.get("questions") else []
-    responses = call.get("responses", "").split("||") if call.get("responses") else []
+def call_value(call: CallRecord | dict[str, Any], key: str, default: Any = None) -> Any:
+    if isinstance(call, dict):
+        return call.get(key, default)
+    return getattr(call, key, default)
+
+
+def set_call_value(call: CallRecord | dict[str, Any], key: str, value: Any) -> None:
+    if isinstance(call, dict):
+        call[key] = value
+    else:
+        setattr(call, key, value)
+
+
+def serialize_call(call: CallRecord | dict[str, Any]) -> dict:
+    questions = call_value(call, "questions", "").split("||") if call_value(call, "questions") else []
+    responses = call_value(call, "responses", "").split("||") if call_value(call, "responses") else []
     
     # Parse and clean transcript
-    transcript_lines = split_transcript_lines(call.get("transcript")) if call.get("transcript") else []
+    transcript = call_value(call, "transcript")
+    transcript_lines = split_transcript_lines(transcript) if transcript else []
     
     # Extract responses if not already available
     if not any(r.strip() for r in responses) and transcript_lines and questions:
-        responses = extract_responses_from_transcript(questions, call.get("transcript"))
+        responses = extract_responses_from_transcript(questions, transcript)
 
     return {
-        "id": call.get("id"),
-        "name": call.get("name", ""),
-        "phone": call.get("phone", ""),
-        "status": call.get("status", "Pending"),
-        "duration": call.get("duration") or "Pending",
-        "externalId": call.get("external_id"),
+        "id": call_value(call, "id"),
+        "name": call_value(call, "name", ""),
+        "phone": call_value(call, "phone", ""),
+        "status": call_value(call, "status", "Pending"),
+        "duration": call_value(call, "duration") or "Pending",
+        "externalId": call_value(call, "external_id"),
         "questionsAsked": questions,
         "responses": responses,
         "transcript": transcript_lines,
-        "createdAt": call.get("created_at") or "",
+        "createdAt": call_value(call, "created_at") or "",
     }
 
 
@@ -217,36 +267,42 @@ def extract_vapi_transcript(data: dict[str, Any]) -> str | None:
     return None
 
 
-def refresh_call_from_vapi(call: dict[str, Any]) -> None:
-    if not call.get("external_id") or call.get("transcript"):
+def refresh_call_from_vapi(call: CallRecord | dict[str, Any], db: Session | None = None) -> None:
+    if not call_value(call, "external_id"):
         return
 
-    ret = get_call_details(str(call.get("external_id")))
+    ret = get_call_details(str(call_value(call, "external_id")))
     if not ret.get("ok"):
         return
 
     body = ret.get("body") or {}
     transcript = extract_vapi_transcript(body)
-    if not transcript:
-        return
+    changed = False
+    if transcript and not call_value(call, "transcript"):
+        set_call_value(call, "transcript", transcript)
+        questions = call_value(call, "questions", "").split("||") if call_value(call, "questions") else FIXED_CALL_QUESTIONS
+        responses = extract_responses_from_transcript(questions, transcript)
+        if any(responses):
+            set_call_value(call, "responses", "||".join(responses))
+        changed = True
 
-    call["transcript"] = transcript
-    questions = call.get("questions", "").split("||") if call.get("questions") else FIXED_CALL_QUESTIONS
-    responses = extract_responses_from_transcript(questions, call["transcript"])
-    if any(responses):
-        call["responses"] = "||".join(responses)
-
-    status = body.get("status")
+    status = extract_vapi_status(body)
     if status:
-        call["status"] = normalize_status(str(status))
+        set_call_value(call, "status", status)
+        changed = True
 
-    duration_seconds = body.get("durationSeconds") or body.get("duration")
+    duration_seconds = extract_vapi_duration(body)
     if duration_seconds:
-        call["duration"] = str(duration_seconds)
+        set_call_value(call, "duration", duration_seconds)
+        changed = True
+
+    if changed and db:
+        db.commit()
+        db.refresh(call)
 
 
 @router.post("/vapi-webhook")
-async def vapi_webhook(request: Request):
+async def vapi_webhook(request: Request, db: Session = Depends(get_db)):
     """Handle VAPI webhook for transcript and call updates."""
     data = await request.json()
     call_id = extract_vapi_call_id(data)
@@ -258,80 +314,108 @@ async def vapi_webhook(request: Request):
     if not call_id:
         return {"ok": False, "error": "Missing callId"}
 
-    temp_id = TEMP_CALLS_BY_EXTERNAL_ID.get(str(call_id))
-    call = TEMP_CALLS.get(temp_id) if temp_id else None
+    call = db.execute(
+        select(CallRecord).where(CallRecord.external_id == str(call_id))
+    ).scalar_one_or_none()
 
     if call:
         if transcript:
-            if call.get("transcript"):
-                existing_lines = set(call["transcript"].split("||"))
+            if call.transcript:
+                existing_lines = set(call.transcript.split("||"))
                 new_lines = transcript.split("||") if isinstance(transcript, str) else [transcript]
                 for line in new_lines:
                     if line.strip() and line.strip() not in existing_lines:
-                        call["transcript"] = f"{call['transcript']}||{line}"
+                        call.transcript = f"{call.transcript}||{line}"
             else:
-                call["transcript"] = transcript
+                call.transcript = transcript
 
-            questions = call.get("questions", "").split("||") if call.get("questions") else FIXED_CALL_QUESTIONS
-            responses = extract_responses_from_transcript(questions, call.get("transcript"))
+            questions = call.questions.split("||") if call.questions else FIXED_CALL_QUESTIONS
+            responses = extract_responses_from_transcript(questions, call.transcript)
             if any(r.strip() for r in responses):
-                call["responses"] = "||".join(responses)
+                call.responses = "||".join(responses)
 
-        status = message.get("status") or data.get("status")
-        if status and isinstance(status, str):
-            call["status"] = normalize_status(status)
+        status = extract_vapi_status(data)
+        if status:
+            call.status = status
 
-    # Temporary DB-free mode: accept Vapi webhooks even when no persisted call exists.
-    return {"ok": True, "id": temp_id, "stored": bool(call)}
+        duration = extract_vapi_duration(data)
+        if duration:
+            call.duration = duration
+
+        db.commit()
+        db.refresh(call)
+
+    return {"ok": True, "id": call.id if call else None, "stored": bool(call)}
 
 
 @router.post("/start-call")
-def start_call(data: CallCreate):
-    temp_id = int(datetime.now().timestamp() * 1000)
-    new_call = {
-        "id": temp_id,
-        "name": data.name,
-        "phone": data.phone,
-        "status": "Pending",
-        "duration": "Pending",
-        "questions": "||".join(FIXED_CALL_QUESTIONS),
-        "responses": "",
-        "transcript": "",
-        "created_at": new_call_timestamp(),
-        "external_id": None,
-    }
+def start_call(data: CallCreate, db: Session = Depends(get_db)):
+    next_id = (db.execute(select(func.max(CallRecord.id))).scalar() or 0) + 1
+    new_call = CallRecord(
+        id=next_id,
+        name=data.name,
+        phone=data.phone,
+        status="Pending",
+        duration="Pending",
+        questions="||".join(FIXED_CALL_QUESTIONS),
+        responses="",
+        transcript="",
+        created_at=new_call_timestamp(),
+        external_id=None,
+    )
 
     try:
-        ret = initiate_call(phone=new_call["phone"], name=new_call["name"])
+        ret = initiate_call(phone=new_call.phone, name=new_call.name)
         if ret.get("ok"):
             body = ret.get("body") or {}
             ext_id = body.get("id") or body.get("call_id") or body.get("external_id")
-            new_call["external_id"] = ext_id
-            new_call["status"] = "Queued"
-            if ext_id:
-                TEMP_CALLS_BY_EXTERNAL_ID[str(ext_id)] = temp_id
+            new_call.external_id = ext_id
+            new_call.status = "Queued"
         else:
             err = ret.get("error")
-            new_call["status"] = "FailedToQueue"
-            new_call["responses"] = f"vapi_error:{err}"
+            new_call.status = "FailedToQueue"
+            new_call.responses = f"vapi_error:{err}"
     except Exception as exc:
-        new_call["status"] = "FailedToQueue"
-        new_call["responses"] = f"vapi_exception:{str(exc)}"
+        new_call.status = "FailedToQueue"
+        new_call.responses = f"vapi_exception:{str(exc)}"
 
-    TEMP_CALLS[temp_id] = new_call
-    message = "Call queued" if new_call["status"] == "Queued" else "Call failed to queue"
+    db.add(new_call)
+    db.commit()
+    db.refresh(new_call)
+    message = "Call queued" if new_call.status == "Queued" else "Call failed to queue"
     return {"message": message, "data": serialize_call(new_call)}
 
 
+@router.get("/db-health")
+def db_health(db: Session = Depends(get_db)):
+    count = db.query(CallRecord).count()
+    latest = db.execute(
+        select(CallRecord).order_by(CallRecord.id.desc()).limit(1)
+    ).scalar_one_or_none()
+    return {
+        "ok": True,
+        "databaseUrl": safe_database_url(),
+        "callsCount": count,
+        "latestCallId": latest.id if latest else None,
+    }
+
+
 @router.get("/calls")
-def get_calls():
-    # Temporary DB-free mode for Railway deployment.
-    return []
+def get_calls(db: Session = Depends(get_db)):
+    calls = db.execute(
+        select(CallRecord).order_by(CallRecord.id.desc())
+    ).scalars().all()
+    for call in calls:
+        refresh_call_from_vapi(call, db)
+    return [
+        serialize_call(call)
+        for call in calls
+    ]
 
 
 @router.get("/calls/{call_id}")
-def get_call(call_id: int):
-    call = TEMP_CALLS.get(call_id)
+def get_call(call_id: int, db: Session = Depends(get_db)):
+    call = db.get(CallRecord, call_id)
     if not call:
         return {
             "id": call_id,
@@ -346,35 +430,37 @@ def get_call(call_id: int):
             "createdAt": "",
         }
 
-    refresh_call_from_vapi(call)
+    refresh_call_from_vapi(call, db)
     return serialize_call(call)
 
 
 @router.post("/calls/{call_id}/end")
-def end_call_endpoint(call_id: int):
+def end_call_endpoint(call_id: int, db: Session = Depends(get_db)):
     """End or cancel an active call."""
     from app.services.vapi import end_call
 
-    call = TEMP_CALLS.get(call_id)
+    call = db.get(CallRecord, call_id)
     if not call:
-        call = {
-            "id": call_id,
-            "name": "Temporary call",
-            "phone": "",
-            "status": "Ended",
-            "duration": "Pending",
-            "questions": "||".join(FIXED_CALL_QUESTIONS),
-            "responses": "",
-            "transcript": "",
-            "created_at": new_call_timestamp(),
-            "external_id": None,
-        }
-        TEMP_CALLS[call_id] = call
+        call = CallRecord(
+            id=call_id,
+            name="Temporary call",
+            phone="",
+            status="Ended",
+            duration="Pending",
+            questions="||".join(FIXED_CALL_QUESTIONS),
+            responses="",
+            transcript="",
+            created_at=new_call_timestamp(),
+            external_id=None,
+        )
+        db.add(call)
 
-    if call.get("external_id") and call.get("status") in ["Queued", "Pending", "In Progress"]:
-        end_call(str(call["external_id"]))
+    if call.external_id and call.status in ["Queued", "Pending", "In Progress"]:
+        end_call(str(call.external_id))
 
-    call["status"] = "Ended"
+    call.status = "Ended"
+    db.commit()
+    db.refresh(call)
     return {"message": "Call ended", "data": serialize_call(call)}
 
 

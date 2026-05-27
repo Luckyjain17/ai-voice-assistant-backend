@@ -2,9 +2,10 @@ import os
 from typing import Any, Dict
 
 import httpx
-from dotenv import load_dotenv
 
-load_dotenv()
+from app.env import load_backend_env
+
+load_backend_env()
 
 VAPI_BASE_URL = os.getenv("VAPI_BASE_URL") or "https://api.vapi.ai"
 VAPI_API_KEY = os.getenv("VAPI_API_KEY")
@@ -16,6 +17,14 @@ VAPI_SERVER_MESSAGES = [
     for message in os.getenv("VAPI_SERVER_MESSAGES", "end-of-call-report,transcript").split(",")
     if message.strip()
 ]
+
+
+def _call_endpoint(call_id: str | None = None) -> str:
+    """Return the Vapi calls endpoint, accepting either base API URL style."""
+    base_url = VAPI_BASE_URL.rstrip("/")
+    if not base_url.endswith("/call"):
+        base_url = f"{base_url}/call"
+    return f"{base_url}/{call_id}" if call_id else base_url
 
 
 def initiate_call(phone: str, name: str) -> Dict[str, Any]:
@@ -54,7 +63,7 @@ def initiate_call(phone: str, name: str) -> Dict[str, Any]:
         "Content-Type": "application/json",
     }
 
-    endpoint = VAPI_BASE_URL
+    endpoint = _call_endpoint()
 
     try:
         with httpx.Client(timeout=20.0) as client:
@@ -76,7 +85,7 @@ def get_call_details(call_id: str) -> Dict[str, Any]:
         "Authorization": f"Bearer {VAPI_API_KEY}",
         "Content-Type": "application/json",
     }
-    endpoint = f"{VAPI_BASE_URL.rstrip('/')}/{call_id}"
+    endpoint = _call_endpoint(call_id)
 
     try:
         with httpx.Client(timeout=20.0) as client:
@@ -99,7 +108,7 @@ def end_call(call_id: str) -> Dict[str, Any]:
         "Authorization": f"Bearer {VAPI_API_KEY}",
         "Content-Type": "application/json",
     }
-    endpoint = f"{VAPI_BASE_URL.rstrip('/')}/{call_id}"
+    endpoint = _call_endpoint(call_id)
 
     try:
         with httpx.Client(timeout=20.0) as client:

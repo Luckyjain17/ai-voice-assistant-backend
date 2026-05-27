@@ -2,10 +2,11 @@ import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+from app.database import init_db
+from app.env import load_backend_env
 from app.routes.calls import router as call_router
 
-load_dotenv()
+load_backend_env()
 
 app = FastAPI()
 
@@ -19,6 +20,11 @@ allow_headers=["*"],
 
 
 app.include_router(call_router)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
 
 @app.get("/")
 def home():
