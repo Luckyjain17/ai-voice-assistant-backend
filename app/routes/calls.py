@@ -2,7 +2,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -432,6 +432,17 @@ def get_call(call_id: int, db: Session = Depends(get_db)):
 
     refresh_call_from_vapi(call, db)
     return serialize_call(call)
+
+
+@router.delete("/calls/{call_id}")
+def delete_call(call_id: int, db: Session = Depends(get_db)):
+    call = db.get(CallRecord, call_id)
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    db.delete(call)
+    db.commit()
+    return {"message": "Call deleted", "id": call_id}
 
 
 @router.post("/calls/{call_id}/end")
